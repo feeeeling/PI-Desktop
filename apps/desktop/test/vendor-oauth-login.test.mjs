@@ -3,10 +3,12 @@ import test from "node:test";
 
 import {
   VendorOAuth,
+  accountModelIds,
   apiStyleForWireApi,
   isXaiConversationModel,
   protocolForApiStyle,
   secretRefForProviderOauth,
+  wireForAccountModel,
 } from "../electron/main/oauth.ts";
 
 /**
@@ -170,6 +172,9 @@ function harness(options = {}) {
       return fakeModels(store, options);
     },
     modelConfigFor: options.modelConfigFor,
+    discoverAccountModels: options.discoverAccountModels ?? (async () => {
+      throw new Error("live model list disabled in test");
+    }),
     newId: () => `id-${++counter}`,
   });
   // The store the module handed pi-ai, so a test can drive it the way a token
@@ -473,7 +478,14 @@ test("Meta device-code OAuth stores the identity refresh token and resolves the 
   const meta = metaFetchMock();
   const previousFetch = globalThis.fetch;
   globalThis.fetch = meta.fetch;
-  const oauth = new VendorOAuth({ call: host.call, emit: (event) => events.push(event), openExternal: async () => {} });
+  const oauth = new VendorOAuth({
+    call: host.call,
+    emit: (event) => events.push(event),
+    openExternal: async () => {},
+    discoverAccountModels: async () => {
+      throw new Error("live model list disabled in test");
+    },
+  });
   try {
     const { loginId } = await oauth.start("meta");
     const device = await waitFor(events, "deviceCode");
@@ -503,7 +515,14 @@ test("Meta OAuth removes the provider row when API-key minting reports an expire
   const meta = metaFetchMock({ mintStatus: 401 });
   const previousFetch = globalThis.fetch;
   globalThis.fetch = meta.fetch;
-  const oauth = new VendorOAuth({ call: host.call, emit: (event) => events.push(event), openExternal: async () => {} });
+  const oauth = new VendorOAuth({
+    call: host.call,
+    emit: (event) => events.push(event),
+    openExternal: async () => {},
+    discoverAccountModels: async () => {
+      throw new Error("live model list disabled in test");
+    },
+  });
   try {
     await oauth.start("meta");
     const error = await waitFor(events, "error", 1200);
@@ -602,20 +621,6 @@ test("conversation-model filter drops xAI image and video ids", () => {
 
 test("an xAI account offers the chat models its /models endpoint returns", async () => {
   const seen = [];
-  const previousFetch = globalThis.fetch;
-  globalThis.fetch = async (url, init) => {
-    seen.push({
-      url: String(url),
-      authorization: init?.headers?.Authorization,
-    });
-    return new Response(JSON.stringify({
-      data: [
-        { id: "grok-4.6" },
-        { id: "grok-4.7" },
-        { id: "grok-imagine-image" },
-      ],
-    }), { status: 200, headers: { "content-type": "application/json" } });
-  };
   const xaiModel = {
     id: "grok-4.6",
     name: "Grok 4.6",
@@ -637,9 +642,18 @@ test("an xAI account offers the chat models its /models endpoint returns", async
     contextWindow: 500_000,
     maxTokens: 500_000,
   };
-  try {
-    const { host, events, oauth } = harness({
-      provider: {
+  const { host, events, oauth } = harness({
+    discoverAccountModels: async (input) => {
+      seen.push(input);
+      return {
+        data: [
+          { id: "grok-4.6" },
+          { id: "grok-4.7" },
+          { id: "grok-imagine-image" },
+        ],
+      };
+    },
+    provider: {
         id: "xai",
         name: "xAI",
         baseUrl: "https://api.x.ai/v1",
@@ -670,8 +684,90 @@ test("an xAI account offers the chat models its /models endpoint returns", async
     assert.equal(binding.apiStyle, "responses");
     assert.equal(binding.baseUrl, "https://api.x.ai/v1");
     assert.equal(seen[0].url, "https://api.x.ai/v1/models");
-    assert.equal(seen[0].authorization, "Bearer access-for-abc");
-  } finally {
-    globalThis.fetch = previousFetch;
-  }
+    assert.equal(seen[0].headers.Authorization, "Bearer access-for-abc");
+});
+
+test("a mixed-wire account keeps new ids only when their family has one wire API", () => {
+  const pinned = [
+    { id: "claude-opus-4.7", api: "anthropic-messages", baseUrl: "https://api.individual.githubcopilot.com" },
+    { id: "gpt-5.5", api: "openai-responses", baseUrl: "https://api.individual.githubcopilot.com" },
+    { id: "gemini-3.5-flash", api: "openai-completions", baseUrl: "https://api.individual.githubcopilot.com" },
+  ];
+  assert.equal(wireForAccountModel("claude-opus-4.9", pinned)?.api, "anthropic-messages");
+  assert.equal(wireForAccountModel("gpt-9", pinned)?.api, "openai-responses");
+  assert.equal(wireForAccountModel("gemini-9", pinned)?.api, "openai-completions");
+  assert.equal(wireForAccountModel("foo-1", pinned), undefined);
+  assert.deepEqual(
+    accountModelIds({
+      data: [
+        { id: "claude-opus-4.9", model_picker_enabled: true },
+        { id: "gpt-9", model_picker_enabled: true },
+        { id: "hidden-gpt", model_picker_enabled: false },
+        { id: "grok-imagine-image", model_picker_enabled: true },
+        { id: "no-tools", model_picker_enabled: true, capabilities: { supports: { tool_calls: false } } },
+      ],
+    }),
+    ["claude-opus-4.9", "gpt-9"],
+  );
+});
+
+test("a Copilot account offers a new model from the same family without a client update", async () => {
+  const seen = [];
+  const base = "https://api.individual.githubcopilot.com";
+  const claude = {
+    id: "claude-opus-4.7",
+    api: "anthropic-messages",
+    provider: "github-copilot",
+    baseUrl: base,
+    input: ["text"],
+    reasoning: true,
+    contextWindow: 200_000,
+    maxTokens: 16_384,
+  };
+  const gpt = {
+    ...claude,
+    id: "gpt-5.5",
+    api: "openai-responses",
+    reasoning: true,
+    contextWindow: 272_000,
+    maxTokens: 128_000,
+  };
+  const { host, events, oauth } = harness({
+    discoverAccountModels: async (input) => {
+      seen.push(input);
+      return {
+        data: [
+          { id: "claude-opus-4.9", model_picker_enabled: true },
+          { id: "gpt-5.5", model_picker_enabled: true },
+          { id: "foo-1", model_picker_enabled: true },
+          { id: "grok-imagine-image", model_picker_enabled: true },
+        ],
+      };
+    },
+    provider: {
+      id: "github-copilot",
+      name: "GitHub Copilot",
+      baseUrl: base,
+      auth: {
+        oauth: {
+          name: "GitHub Copilot",
+          isSubscription: true,
+          loginLabel: "Sign in with GitHub Copilot",
+        },
+      },
+    },
+    models: [claude, gpt],
+  });
+  const { loginId } = await oauth.start("github-copilot");
+  const prompt = await waitFor(events, "prompt");
+  oauth.respond({ loginId, promptId: prompt.request.promptId, value: "abc" });
+  const done = await waitFor(events, "done");
+  const row = host.providers.get(done.providerId);
+  assert.deepEqual(row.models.map((model) => model.id), ["claude-opus-4.9", "gpt-5.5"]);
+  const claudeBinding = await oauth.bindingFor(done.providerId, "claude-opus-4.9");
+  assert.equal(claudeBinding.apiStyle, "anthropic_messages");
+  assert.equal(await oauth.bindingFor(done.providerId, "foo-1"), undefined);
+  assert.equal(seen[0].url, `${base}/models`);
+  assert.equal(seen[0].headers.Authorization, "Bearer access-for-abc");
+  assert.equal(seen[0].headers["Copilot-Integration-Id"], "vscode-chat");
 });

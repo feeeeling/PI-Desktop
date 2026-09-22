@@ -41,7 +41,7 @@ import {
   type ModelConfig,
   type VendorModelBinding,
 } from "@pi-desktop/agent-runtime";
-import { discoverProviderModels } from "./model-discovery.ts";
+import { modelListRequest } from "./model-discovery.ts";
 import {
   OAUTH_AUTH_KIND,
   type OAuthLoginEvent,
@@ -91,9 +91,7 @@ export function protocolForApiStyle(apiStyle: string): string {
   return PROTOCOL_BY_API_STYLE[apiStyle] ?? "openai_compatible";
 }
 
-const XAI_VENDOR_ID = "xai";
-const XAI_MODELS_URL_BASE = "https://api.x.ai/v1";
-const XAI_LIVE_MODELS_TTL_MS = 30_000;
+const LIVE_MODELS_TTL_MS = 30_000;
 const THINKING_LEVEL_ORDER = [
   "off",
   "minimal",
@@ -105,15 +103,170 @@ const THINKING_LEVEL_ORDER = [
 ] as const satisfies readonly ThinkingLevel[];
 
 /**
- * xAI's `/models` list also publishes image and video generators. Those are not
- * conversation models; the chat picker and session launch both reject them.
+ * Vendor `/models` payloads also publish image, video, speech and embedding
+ * models. Those are not conversation models; the chat picker and session
+ * launch both reject them.
  */
-const XAI_NON_CONVERSATION_MODEL =
+const NON_CONVERSATION_MODEL =
   /(?:^|[-_/])(?:imagine|image|video|tts|stt|embed(?:ding)?|whisper|aurora|flux)(?:$|[-_/])/i;
 
-export function isXaiConversationModel(modelId: string): boolean {
+export function isConversationModel(modelId: string): boolean {
   const id = modelId.trim();
-  return id.length > 0 && !XAI_NON_CONVERSATION_MODEL.test(id);
+  return id.length > 0 && !NON_CONVERSATION_MODEL.test(id);
+}
+
+/** @deprecated Use {@link isConversationModel}. Kept so callers of the xAI fix still compile. */
+export function isXaiConversationModel(modelId: string): boolean {
+  return isConversationModel(modelId);
+}
+
+/** Leading letter run: `claude-opus-4.8` and `gpt-5.5` belong to different wire APIs. */
+export function modelFamily(modelId: string): string {
+  return /^[a-z]+/i.exec(modelId.trim())?.[0]?.toLowerCase() ?? modelId.trim().toLowerCase();
+}
+
+const COPILOT_LIST_HEADERS: Record<string, string> = {
+  Accept: "application/json",
+  "User-Agent": "GitHubCopilotChat/0.35.0",
+  "Editor-Version": "vscode/1.107.0",
+  "Editor-Plugin-Version": "copilot-chat/0.35.0",
+  "Copilot-Integration-Id": "vscode-chat",
+};
+
+/**
+ * Where to ask a signed-in account which models it serves.
+ * One wire API uses that API's list endpoint. Mixed catalogs (Copilot) use
+ * the account's OpenAI-compatible `/models`.
+ */
+export function accountModelListRequest(input: {
+  vendorId: string;
+  api: string | undefined;
+  baseUrl: string;
+  apiKey: string;
+}): { url: string; headers: Record<string, string> } {
+  const base = input.baseUrl.trim().replace(/\/+$/, "");
+  if (input.vendorId === "github-copilot") {
+    return {
+      url: `${base}/models`,
+      headers: { ...COPILOT_LIST_HEADERS, Authorization: `Bearer ${input.apiKey}` },
+    };
+  }
+  if (input.api === "anthropic-messages" && input.apiKey.includes("sk-ant-oat")) {
+    const root = base.endsWith("/v1") ? base : `${base}/v1`;
+    return {
+      url: `${root}/models?limit=1000`,
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${input.apiKey}`,
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+      },
+    };
+  }
+  return modelListRequest({
+    baseUrl: base,
+    apiKey: input.apiKey,
+    apiStyle: input.api ? apiStyleForWireApi(input.api) : "chat_completions",
+  });
+}
+
+type PinnedWire = { id: string; api: string; baseUrl: string };
+
+/** Map one live id onto a wire API. Unknown families on a mixed catalog are dropped. */
+export function wireForAccountModel(
+  modelId: string,
+  pinned: readonly PinnedWire[],
+  authBaseUrl?: string,
+): { api: string; baseUrl: string } | undefined {
+  const known = pinned.find((model) => model.id === modelId);
+  if (known) {
+    return { api: known.api, baseUrl: authBaseUrl || known.baseUrl };
+  }
+  const apis = new Set(pinned.map((model) => model.api));
+  const bases = new Set(pinned.map((model) => model.baseUrl));
+  if (apis.size === 1 && bases.size === 1) {
+    return { api: [...apis][0]!, baseUrl: authBaseUrl || [...bases][0]! };
+  }
+  const family = modelFamily(modelId);
+  const matches = pinned.filter((model) => modelFamily(model.id) === family);
+  const matchApis = new Set(matches.map((model) => model.api));
+  const matchBases = new Set(matches.map((model) => model.baseUrl));
+  if (matchApis.size !== 1 || matchBases.size !== 1) return undefined;
+  return { api: [...matchApis][0]!, baseUrl: authBaseUrl || [...matchBases][0]! };
+}
+
+function asModelRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+/** Conversation ids from an OpenAI- or Anthropic-shaped model list. */
+export function accountModelIds(body: unknown): string[] {
+  const record = asModelRecord(body);
+  const data = Array.isArray(record?.data)
+    ? record.data
+    : Array.isArray(body)
+      ? body
+      : [];
+  const pickerScoped = data.some((entry) => {
+    const item = asModelRecord(entry);
+    return typeof item?.model_picker_enabled === "boolean";
+  });
+  const ids: string[] = [];
+  for (const entry of data) {
+    const item = asModelRecord(entry);
+    const id = item?.id;
+    if (!item || typeof id !== "string" || !isConversationModel(id)) continue;
+    if (pickerScoped && item.model_picker_enabled !== true) continue;
+    const capabilities = asModelRecord(item.capabilities);
+    const supports = asModelRecord(capabilities?.supports);
+    if (supports?.tool_calls === false) continue;
+    const policy = asModelRecord(item.policy);
+    if (policy?.state === "disabled") continue;
+    ids.push(id);
+  }
+  return [...new Set(ids)].sort((left, right) => left.localeCompare(right));
+}
+
+export function accountModelOptions(
+  body: unknown,
+  pinned: readonly Model<Api>[],
+  authBaseUrl?: string,
+): OAuthModelOption[] {
+  const wires: PinnedWire[] = pinned.map((model) => ({
+    id: model.id,
+    api: model.api,
+    baseUrl: model.baseUrl,
+  }));
+  const options: OAuthModelOption[] = [];
+  for (const modelId of accountModelIds(body)) {
+    const wire = wireForAccountModel(modelId, wires, authBaseUrl);
+    if (!wire) continue;
+    options.push({
+      modelId,
+      apiStyle: apiStyleForWireApi(wire.api),
+      baseUrl: wire.baseUrl,
+    });
+  }
+  return options;
+}
+
+async function fetchAccountModelList(request: {
+  url: string;
+  headers: Record<string, string>;
+}): Promise<unknown> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const response = await fetch(request.url, { headers: request.headers, signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`model list request failed (${response.status})`);
+    }
+    return await response.json();
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function thinkingLevelsFromPiModel(model: Model<Api>): ThinkingLevel[] {
@@ -170,6 +323,15 @@ export type VendorOAuthDeps = {
     vendorKey: string;
     option: OAuthModelOption;
   }) => Promise<ModelConfig | undefined>;
+  /**
+   * Test seam for the account model-list request. Production fetches the URL.
+   * Throw to force the pinned-catalog fallback.
+   */
+  discoverAccountModels?: (input: {
+    vendorId: string;
+    url: string;
+    headers: Record<string, string>;
+  }) => Promise<unknown>;
   newId?: () => string;
 };
 
@@ -234,8 +396,8 @@ export class VendorOAuth {
   private readonly logins = new Map<string, LoginSession>();
   /** One pi-ai collection and credential store per local OAuth account row. */
   private readonly accountModels = new Map<string, AccountModels>();
-  /** Successful xAI `/models` responses, so one login does not refetch per model. */
-  private readonly xaiLiveModels = new Map<string, { at: number; models: OAuthModelOption[] }>();
+  /** Successful account `/models` responses, so one login does not refetch per model. */
+  private readonly liveModels = new Map<string, { at: number; models: OAuthModelOption[] }>();
   /** Per-account write chain: `modify` must be a serialized read-modify-write. */
   private readonly chains = new Map<string, Promise<unknown>>();
   private catalogPromise?: Promise<MutableModels>;
@@ -362,7 +524,7 @@ export class VendorOAuth {
       await running.finished?.catch(() => undefined);
     }
     this.accountModels.delete(providerId);
-    this.xaiLiveModels.delete(providerId);
+    this.liveModels.delete(providerId);
     await this.deps.call("providers.delete", { id: providerId });
   }
 
@@ -384,21 +546,20 @@ export class VendorOAuth {
   /**
    * Models the signed-in account may actually use.
    *
-   * Copilot and the other static vendors still come from pi-ai: `getAvailable`
-   * applies that vendor's `filterModels`. xAI is different. Its pinned catalog
-   * stops at whatever shipped in pi-ai, so a model Grok has already entitled
-   * (grok-4.7 today) never becomes selectable. For that vendor the account's
-   * own `GET /v1/models` list is the authority, and the pinned catalog is only
-   * the fallback when that request fails.
+   * A pinned pi-ai catalog goes stale the day the vendor ships a model, which
+   * is why selecting it used to require a client update. When the account
+   * token can read `/models`, that chat-model list is the authority. Vendors
+   * that already publish a live catalog (Radius) are left alone. A failed
+   * probe keeps `getAvailable`, including Copilot's subscription filter.
    */
   async listModels(providerId: string): Promise<OAuthModelOption[]> {
     return this.withRowHeaders(providerId, async () => {
       const account = await this.accountForProvider(providerId);
       if (!account) throw new Error(`unknown vendor account provider: ${providerId}`);
-      // Dynamic catalogs (radius, Copilot) are empty until refreshed; static and
+      // Dynamic catalogs (radius) are empty until refreshed; static and
       // unconfigured providers are skipped inside pi-ai.
       await account.models.refresh({ providers: [account.vendorId] });
-      const live = await this.liveXaiModels(account);
+      const live = await this.liveAccountModels(account);
       if (live) return live;
       const available = await account.models.getAvailable(account.vendorId);
       return available.map((model) => this.optionFor(model));
@@ -443,11 +604,11 @@ export class VendorOAuth {
       await account.models.refresh({ providers: [account.vendorId] });
       model = account.models.getModel(account.vendorId, modelId);
     }
-    const live = await this.liveXaiModels(account);
+    const live = await this.liveAccountModels(account);
     if (live) {
       const option = live.find((item) => item.modelId === modelId);
-      // A successful Grok list replaces the pinned catalog. An id it did not
-      // return is not offered, even when pi-ai still ships that id.
+      // A successful account list replaces the pinned catalog. An id it did
+      // not return is not offered, even when pi-ai still ships that id.
       if (!option) return undefined;
       return this.bindingFromOption(account, option);
     }
@@ -456,53 +617,67 @@ export class VendorOAuth {
   }
 
   /**
-   * Chat models the signed-in xAI account can call right now.
-   * `undefined` means the live list could not be read; callers keep the
-   * pinned catalog. Image and video generators are dropped.
+   * Chat models this signed-in account can call right now.
+   * `undefined` means the live list could not be read or the vendor already
+   * refreshes its own catalog; callers keep `getAvailable`.
    */
-  private async liveXaiModels(
+  private async liveAccountModels(
     account: AccountModels,
   ): Promise<OAuthModelOption[] | undefined> {
-    if (account.vendorId !== XAI_VENDOR_ID) return undefined;
-    const cached = this.xaiLiveModels.get(account.providerId);
-    if (cached && Date.now() - cached.at < XAI_LIVE_MODELS_TTL_MS) return cached.models;
+    const provider = account.models.getProvider(account.vendorId);
+    if (typeof provider?.refreshModels === "function") return undefined;
+    const cached = this.liveModels.get(account.providerId);
+    if (cached && Date.now() - cached.at < LIVE_MODELS_TTL_MS) return cached.models;
+    const pinned = await this.pinnedCatalog(account);
+    if (pinned.length === 0) return undefined;
     let apiKey: string | undefined;
-    let baseUrl = XAI_MODELS_URL_BASE;
+    let authBaseUrl: string | undefined;
     try {
       const resolved = await account.models.getAuth(account.vendorId);
       apiKey = resolved?.auth.apiKey;
-      if (resolved?.auth.baseUrl) baseUrl = resolved.auth.baseUrl.replace(/\/+$/, "");
+      if (resolved?.auth.baseUrl) authBaseUrl = resolved.auth.baseUrl.replace(/\/+$/, "");
     } catch (error) {
-      this.log("warn", "xAI account auth unavailable for model list", {
+      this.log("warn", "account auth unavailable for model list", {
         vendorId: account.vendorId,
         message: error instanceof Error ? error.message : String(error),
       });
       return undefined;
     }
     if (!apiKey) return undefined;
+    const listBase = authBaseUrl || pinned[0]?.baseUrl;
+    if (!listBase) return undefined;
+    const apis = new Set(pinned.map((model) => model.api));
+    const request = accountModelListRequest({
+      vendorId: account.vendorId,
+      api: apis.size === 1 ? pinned[0]!.api : undefined,
+      baseUrl: listBase,
+      apiKey,
+    });
     try {
-      const discovered = await discoverProviderModels({
-        baseUrl,
-        apiKey,
-        apiStyle: "responses",
-      });
-      const models = discovered
-        .filter((model) => isXaiConversationModel(model.modelId))
-        .map((model) => ({
-          modelId: model.modelId,
-          apiStyle: apiStyleForWireApi("openai-responses"),
-          baseUrl,
-        }));
+      const body = this.deps.discoverAccountModels
+        ? await this.deps.discoverAccountModels({
+            vendorId: account.vendorId,
+            url: request.url,
+            headers: request.headers,
+          })
+        : await fetchAccountModelList(request);
+      const models = accountModelOptions(body, pinned, authBaseUrl);
       if (models.length === 0) return undefined;
-      this.xaiLiveModels.set(account.providerId, { at: Date.now(), models });
+      this.liveModels.set(account.providerId, { at: Date.now(), models });
       return models;
     } catch (error) {
-      this.log("warn", "xAI account model list failed", {
+      this.log("warn", "account model list failed", {
         vendorId: account.vendorId,
         message: error instanceof Error ? error.message : String(error),
       });
       return undefined;
     }
+  }
+
+  private async pinnedCatalog(account: AccountModels): Promise<Model<Api>[]> {
+    const provider = account.models.getProvider(account.vendorId);
+    if (typeof provider?.getModels === "function") return [...provider.getModels()];
+    return [...(await account.models.getAvailable(account.vendorId))];
   }
 
   private async bindingFromOption(
@@ -513,7 +688,7 @@ export class VendorOAuth {
       vendorKey: account.vendorId,
       option,
     }).catch(() => undefined);
-    const modelConfig = this.withPinnedXaiFallback(account, option, published);
+    const modelConfig = await this.withPinnedSiblingFallback(account, option, published);
     const capabilities = capabilitiesFromModelConfig(modelConfig);
     return {
       apiStyle: option.apiStyle,
@@ -525,20 +700,22 @@ export class VendorOAuth {
 
   /**
    * models.dev is the metadata source when it already knows the id. A model
-   * that exists only on the live xAI list (the usual case for a just-released
-   * Grok) otherwise inherits limits and thinking levels from the newest pinned
-   * sibling, instead of the 128k generic shape.
+   * that exists only on the live account list otherwise inherits limits and
+   * thinking levels from a pinned sibling of the same family, instead of the
+   * 128k generic shape.
    */
-  private withPinnedXaiFallback(
+  private async withPinnedSiblingFallback(
     account: AccountModels,
     option: OAuthModelOption,
     published: ModelConfig | undefined,
-  ): ModelConfig {
+  ): Promise<ModelConfig> {
     const config = published ?? genericModelConfig(option.modelId, option.baseUrl);
-    if (account.vendorId !== XAI_VENDOR_ID || config.source !== "generic") return config;
-    const sibling = ["grok-4.6", "grok-4.5", "grok-4.3"]
-      .map((id) => account.models.getModel(account.vendorId, id))
-      .find((model) => model !== undefined);
+    if (config.source !== "generic") return config;
+    const pinned = await this.pinnedCatalog(account);
+    if (pinned.some((model) => model.id === option.modelId)) return config;
+    const family = modelFamily(option.modelId);
+    const sibling = pinned.find((model) => modelFamily(model.id) === family)
+      ?? pinned.find((model) => apiStyleForWireApi(model.api) === option.apiStyle);
     if (!sibling) return config;
     const input = (sibling.input ?? []).filter(
       (modality): modality is "text" | "image" => modality === "text" || modality === "image",

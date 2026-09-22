@@ -542,10 +542,11 @@ The canonical DDL lives in [04-data-storage](04-data-storage.md) (D086). Summary
   (`models.getAvailable`, which applies the vendor's own `filterModels`, so a
   Copilot account lists what its subscription includes) instead of calling
   `/models`; each returned model carries the apiStyle its wire API implies.
-  Static vendors such as `openai-codex` use the pinned pi-ai catalog (0.86.1
-  includes `gpt-6-astra`); models.dev does not invent those IDs. `xai` is the
-  exception: conversation models come from `GET /v1/models` on the resolved
-  account token, and the pinned catalog is used only when that request fails.
+  Static vendors such as `openai-codex` still ship a pinned pi-ai catalog
+  (0.86.1 includes `gpt-6-astra`) as the fallback. Conversation models for an
+  OAuth account come from `GET /models` on the resolved account token, so a
+  new id does not wait for a client update; the pinned catalog is used only
+  when that request fails. Radius keeps its own refresh and is not probed.
 - out: `{ models: ModelCatalogItem[] }`; each known model carries the complete
   models.dev metadata including `reasoning`, `supportedThinkingLevels`, limits,
   modalities, output types, and capability tags. Cached/provider claims cannot

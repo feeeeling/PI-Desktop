@@ -64,11 +64,18 @@ async function fixture(outcomes, run) {
   };
   const host = hostFixture();
   const events = [];
-  const oauth = new VendorOAuth({ call: host.call, openExternal: async () => {}, emit: event => {
-    events.push(event);
-    if (event.kind === "prompt") oauth.respond({ loginId: event.loginId,
-      promptId: event.request.promptId, value: "fixture-authorization-code" });
-  } });
+  const oauth = new VendorOAuth({
+    call: host.call,
+    openExternal: async () => {},
+    discoverAccountModels: async () => {
+      throw new Error("live model list disabled in test");
+    },
+    emit: event => {
+      events.push(event);
+      if (event.kind === "prompt") oauth.respond({ loginId: event.loginId,
+        promptId: event.request.promptId, value: "fixture-authorization-code" });
+    },
+  });
   const signIn = async () => {
     await oauth.start("anthropic");
     await until(() => events.some(e => ["done", "error", "cancelled"].includes(e.kind)));

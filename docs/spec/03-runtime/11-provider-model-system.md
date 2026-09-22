@@ -447,19 +447,20 @@ nothing may be cached in the payload or the runtime; and because the row's
 turns instead of rebuilding it. The sidecar therefore never holds the refresh
 token, and holds an access token only for the provider its session is bound to.
 
-Model discovery for such a row reads the authenticated catalog
-(`models.getAvailable`, which applies the vendor's own `filterModels`) rather
-than probing `/models`, and the connection test proves the account by resolving
-auth. For static OAuth vendors such as ChatGPT Plus/Pro (`openai-codex`), that
-catalog is the pinned pi-ai model list rather than a live vendor `/models`
-probe, so a newly published account model such as `gpt-6-astra` appears only
-after the pin includes it. xAI (`xai`, the Grok/X subscription) is the
-exception: a successful `GET /v1/models` with the resolved account token is the
-list of conversation models the account may use, including an id the pinned
-pi-ai catalog does not know yet. Image and video generators in that payload
-are dropped. When the request fails, the pinned catalog remains the fallback.
-models.dev still supplies metadata once the ID is available, but it cannot add
-the ID to the authenticated list. A vendor may
+The connection test proves the account by resolving auth. Model discovery
+probes `GET /models` with that same account token. For static OAuth vendors
+such as ChatGPT Plus/Pro (`openai-codex`), `getAvailable` (which applies the
+vendor's own `filterModels`) is only the fallback. A successful `GET /models` with the resolved
+account token is the list of conversation models the account may use,
+including an id the pinned pi-ai catalog does not know yet. Image, video,
+speech and embedding ids are dropped. On a mixed-wire vendor such as GitHub
+Copilot, a new id is offered only when its family (`claude`, `gpt`, `gemini`,
+…) already maps to one wire API in the pin; an unknown family is left out
+rather than guessed. Vendors that already refresh their own catalog (Radius)
+are not probed again. When the request fails, `getAvailable` remains the
+fallback, so a newly published account model appears without a client update
+whenever the vendor's list includes it. models.dev still supplies metadata
+once the ID is available, but it cannot add the ID by itself. A vendor may
 span wire APIs — Copilot serves Anthropic, Chat Completions and Responses
 models — so the row's `apiStyle` follows the selected model.
 Deleting a row calls the normal host `providers.delete` path, which removes its
